@@ -1,0 +1,1240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anaglyph Asteroids</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+
+  /* HUD is a plain DOM overlay so it stays OUTSIDE the anaglyph stereo
+     render — rendering it in-scene would double-image it. */
+  #hud {
+    position: fixed; inset: 0; pointer-events: none; user-select: none;
+    font-family: "Courier New", Courier, monospace; color: #dfe9ff;
+    text-shadow: 0 0 6px rgba(140, 180, 255, 0.7);
+  }
+  #score { position: absolute; top: 16px; left: 22px;  font-size: 30px; letter-spacing: 3px; }
+  #lives { position: absolute; top: 54px; left: 24px;  font-size: 15px; letter-spacing: 7px; }
+  #wave  { position: absolute; top: 20px; right: 26px; font-size: 20px; letter-spacing: 3px; }
+  #msg {
+    position: absolute; top: 34%; width: 100%; text-align: center;
+    font-size: 34px; letter-spacing: 8px; line-height: 2.0; white-space: pre-line;
+  }
+  #msg small { display: block; font-size: 15px; letter-spacing: 2px; opacity: 0.85; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div id="score"></div>
+  <div id="lives"></div>
+  <div id="wave"></div>
+  <div id="msg"></div>
+</div>
+
+<script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ================================================================== *
+ *  ANAGLYPH EFFECT                                                   *
+ *  Adapted from three.js examples (MIT). Inlined rather than         *
+ *  imported because the stock effect hard-codes eyeSep = 0.064,      *
+ *  which is invisible at this scene's scale; this copy exposes it.   *
+ *  Uses the Dubois red/cyan matrices.                                *
+ * ================================================================== */
+class AnaglyphEffect {
+
+  constructor( renderer, width = 512, height = 512 ) {
+
+    this.colorMatrixLeft = new THREE.Matrix3().fromArray( [
+       0.4561,    -0.0400822, -0.0152161,
+       0.500484,  -0.0378246, -0.0205971,
+       0.176381,  -0.0157589, -0.00546856
+    ] );
+
+    this.colorMatrixRight = new THREE.Matrix3().fromArray( [
+      -0.0434706,  0.378476,  -0.0721527,
+      -0.0879388,  0.73364,   -0.112961,
+      -0.00155529, -0.0184503, 1.2264
+    ] );
+
+    const _camera = new THREE.OrthographicCamera( -1, 1, 1, -1, 0, 1 );
+    const _scene = new THREE.Scene();
+    const _stereo = new THREE.StereoCamera();
+    const _params = { minFilter: THREE.LinearFilter, magFilter: THREE.NearestFilter, format: THREE.RGBAFormat };
+    const _renderTargetL = new THREE.WebGLRenderTarget( width, height, _params );
+    const _renderTargetR = new THREE.WebGLRenderTarget( width, height, _params );
+
+    const _material = new THREE.ShaderMaterial( {
+      uniforms: {
+        mapLeft:  { value: _renderTargetL.texture },
+        mapRight: { value: _renderTargetR.texture },
+        colorMatrixLeft:  { value: this.colorMatrixLeft },
+        colorMatrixRight: { value: this.colorMatrixRight }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+        }`,
+      fragmentShader: `
+        uniform sampler2D mapLeft;
+        uniform sampler2D mapRight;
+        uniform mat3 colorMatrixLeft;
+        uniform mat3 colorMatrixRight;
+        varying vec2 vUv;
+        void main() {
+          vec4 colorL = texture2D( mapLeft, vUv );
+          vec4 colorR = texture2D( mapRight, vUv );
+          vec3 color = clamp( colorMatrixLeft * colorL.rgb + colorMatrixRight * colorR.rgb, 0.0, 1.0 );
+          gl_FragColor = vec4( color, max( colorL.a, colorR.a ) );
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }`
+    } );
+
+    const _mesh = new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), _material );
+    _scene.add( _mesh );
+
+    this.setEyeSeparation = function ( eyeSep ) { _stereo.eyeSep = eyeSep; };
+
+    this.setSize = function ( width, height ) {
+      renderer.setSize( width, height );
+      const pixelRatio = renderer.getPixelRatio();
+      _renderTargetL.setSize( width * pixelRatio, height * pixelRatio );
+      _renderTargetR.setSize( width * pixelRatio, height * pixelRatio );
+    };
+
+    this.render = function ( scene, camera ) {
+      const currentRenderTarget = renderer.getRenderTarget();
+      if ( scene.matrixWorldAutoUpdate === true ) scene.updateMatrixWorld();
+      if ( camera.parent === null && camera.matrixWorldAutoUpdate === true ) camera.updateMatrixWorld();
+      _stereo.update( camera );
+      renderer.setRenderTarget( _renderTargetL );
+      renderer.clear();
+      renderer.render( scene, _stereo.cameraL );
+      renderer.setRenderTarget( _renderTargetR );
+      renderer.clear();
+      renderer.render( scene, _stereo.cameraR );
+      renderer.setRenderTarget( null );
+      renderer.render( _scene, _camera );
+      renderer.setRenderTarget( currentRenderTarget );
+    };
+  }
+}
+
+/* ================================================================== *
+ *  RENDER / SCENE CONSTANTS (not difficulty — fixed at boot)         *
+ * ================================================================== */
+const RENDER = {
+  fieldSize: 150,                    // edge length of the toroidal cube
+  camera: { fov: 55, y: 62, z: 195 },// fixed camera, slight downward tilt
+  stereo: {
+    eyeSep: 4.0,                     // stereo strength, world units
+    focusOffset: 15,                 // convergence plane this much nearer than cube center
+  },
+  starCount: 450,
+};
+const FIELD_HALF = RENDER.fieldSize / 2;
+
+/* ================================================================== *
+ *  DIFFICULTY CONFIG — every gameplay tunable lives here.            *
+ *  Presets deep-merge over the base (select with 1/2/3 on title).    *
+ * ================================================================== */
+const DIFFICULTY_BASE = {
+  ship: {
+    lives: 3,
+    thrust: 60,            // acceleration, units/s^2
+    damping: 0.6,          // exponential velocity decay per second
+    maxSpeed: 60,
+    rotRate: 2.8,          // nose rotation rate, rad/s (arrows/WASD)
+    mouseSensitivity: 0.0025, // radians of nose rotation per pixel of mouse
+    invertPitch: false,    // flip pitch direction (keys and mouse) if it feels backwards
+    bankAngle: 0.55,       // visual roll (radians) while yawing
+    radius: 2.6,           // collision radius
+    fireInterval: 0.2,     // seconds between shots
+    maxBullets: 8,         // max player bullets alive at once
+    bulletSpeed: 100,
+    bulletLife: 1.3,       // seconds
+    respawnDelay: 1.5,
+    respawnInvuln: 2.5,    // invulnerability seconds after (re)spawn
+    safeRespawnRadius: 32, // center must be this clear before respawning
+    hyperspace: {
+      travelTime: 0.6,      // seconds the ship is "elsewhere"
+      cooldown: 2.0,        // seconds between jumps, after re-entry
+      destructChance: 0.06, // classic risk: chance the jump kills you
+    },
+  },
+  waves: {
+    baseAsteroids: 4,      // large asteroids in wave 1
+    asteroidsPerWave: 1,   // extra large asteroids per wave
+    maxAsteroids: 11,
+    baseSpeed: 10,         // large-asteroid speed in wave 1
+    speedPerWave: 1.4,
+    speedCap: 26,
+    spawnSafeRadius: 45,   // asteroids never spawn this close to the ship
+    clearDelay: 2.0,       // pause between clearing a wave and the next
+  },
+  asteroids: {
+    sizes: [ // large -> medium -> small
+      { radius: 9.0, speedMul: 1.0, score: 20,  children: 2 },
+      { radius: 5.2, speedMul: 1.7, score: 50,  children: 2 },
+      { radius: 2.9, speedMul: 2.4, score: 100, children: 0 },
+    ],
+    maxTumble: 1.1,        // max angular speed, rad/s
+  },
+  saucers: {
+    firstDelay: 14,          // seconds into a game before the first saucer
+    baseInterval: 18,        // spawn interval at score 0
+    minInterval: 6,          // spawn interval floor
+    intervalRampScore: 25000,// score at which interval reaches the floor
+    maxActive: 2,
+    lifetime: 24,            // seconds before a saucer leaves the field
+    smallChanceBase: 0.25,   // chance a spawn is the small (deadly) variant
+    smallChanceMax: 0.9,
+    smallChanceRampScore: 30000,
+    large: { radius: 6.5, speed: 15, wanderInterval: 2.6, fireInterval: 1.5,
+             bulletSpeed: 55, bulletLife: 2.4, score: 200 },
+    small: { radius: 3.6, speed: 24, wanderInterval: 1.8, fireInterval: 1.2,
+             bulletSpeed: 75, bulletLife: 2.2, score: 1000,
+             aimErrorMax: 0.5,   // aim error (radians) at score 0
+             aimErrorMin: 0.05,  // aim error floor
+             aimRampScore: 40000 },
+  },
+  scoring: { extraLifeEvery: 10000 },
+};
+
+const DIFFICULTY_PRESETS = {
+  easy: {
+    ship:    { lives: 4, fireInterval: 0.16, hyperspace: { destructChance: 0.02 } },
+    waves:   { baseAsteroids: 3, baseSpeed: 8, speedPerWave: 1.0 },
+    saucers: { firstDelay: 25, baseInterval: 26, minInterval: 10,
+               small: { aimErrorMax: 0.7, aimErrorMin: 0.15 } },
+  },
+  normal: {},
+  hard: {
+    ship:    { hyperspace: { destructChance: 0.1 } },
+    waves:   { baseAsteroids: 5, baseSpeed: 13, speedPerWave: 2.0, speedCap: 34 },
+    saucers: { firstDelay: 8, baseInterval: 12, minInterval: 4, smallChanceBase: 0.45,
+               small: { aimErrorMax: 0.35, aimErrorMin: 0.03 } },
+  },
+};
+
+function deepMerge( base, over ) {
+  const out = { ...base };
+  for ( const k in over ) {
+    if ( over[k] && typeof over[k] === 'object' && !Array.isArray( over[k] ) &&
+         base[k] && typeof base[k] === 'object' && !Array.isArray( base[k] ) ) {
+      out[k] = deepMerge( base[k], over[k] );
+    } else {
+      out[k] = over[k];
+    }
+  }
+  return out;
+}
+
+let C = deepMerge( DIFFICULTY_BASE, DIFFICULTY_PRESETS.normal ); // active config
+
+/* ================================================================== *
+ *  RENDERER / SCENE / CAMERA                                         *
+ * ================================================================== */
+const renderer = new THREE.WebGLRenderer( { antialias: true } );
+renderer.setPixelRatio( Math.min( window.devicePixelRatio, 2 ) );
+renderer.setClearColor( 0x000000 );
+document.body.appendChild( renderer.domElement );
+
+const scene = new THREE.Scene();
+
+const camera = new THREE.PerspectiveCamera(
+  RENDER.camera.fov, window.innerWidth / window.innerHeight, 1, 2000 );
+camera.position.set( 0, RENDER.camera.y, RENDER.camera.z );
+camera.lookAt( 0, 0, 0 );
+// Convergence plane slightly in front of the cube center: most of the
+// playfield sits "behind the screen", the near face pops out gently.
+camera.focus = camera.position.length() - RENDER.stereo.focusOffset;
+
+const effect = new AnaglyphEffect( renderer );
+effect.setEyeSeparation( RENDER.stereo.eyeSep );
+effect.setSize( window.innerWidth, window.innerHeight );
+
+scene.add( new THREE.AmbientLight( 0xffffff, 0.5 ) );
+const keyLight = new THREE.DirectionalLight( 0xffffff, 2.2 );
+keyLight.position.set( 80, 120, 150 );
+scene.add( keyLight );
+const fillLight = new THREE.DirectionalLight( 0x8899ff, 0.6 );
+fillLight.position.set( -70, -50, -110 );
+scene.add( fillLight );
+
+// Boundary cube — the wireframe makes the wrap volume and depth readable.
+// Color must be bright and near-neutral: the Dubois matrices derive the
+// left (red) eye almost entirely from a color's red/green content, so a
+// dark saturated blue only reaches one eye and won't fuse in stereo.
+const boundary = new THREE.LineSegments(
+  new THREE.EdgesGeometry( new THREE.BoxGeometry( RENDER.fieldSize, RENDER.fieldSize, RENDER.fieldSize ) ),
+  new THREE.LineBasicMaterial( { color: 0x9db8d2, transparent: true, opacity: 0.85 } ) );
+scene.add( boundary );
+
+// Faint floor grid on the bottom face — extra depth cue. Same rule:
+// desaturated gray-blues so both eyes see it.
+const grid = new THREE.GridHelper( RENDER.fieldSize, 10, 0x6a7f95, 0x39434f );
+grid.position.y = -FIELD_HALF;
+scene.add( grid );
+
+// Distant starfield (well outside the cube) for stereo depth contrast.
+{
+  const positions = new Float32Array( RENDER.starCount * 3 );
+  const v = new THREE.Vector3();
+  for ( let i = 0; i < RENDER.starCount; i++ ) {
+    v.randomDirection().multiplyScalar( 260 + Math.random() * 380 );
+    positions.set( [ v.x, v.y, v.z ], i * 3 );
+  }
+  const starGeo = new THREE.BufferGeometry();
+  starGeo.setAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
+  scene.add( new THREE.Points( starGeo,
+    new THREE.PointsMaterial( { color: 0x99aabb, size: 1.6, sizeAttenuation: true, depthWrite: false } ) ) );
+}
+
+/* ================================================================== *
+ *  HUD (DOM overlay — never enters the stereo render)                *
+ * ================================================================== */
+const elScore = document.getElementById( 'score' );
+const elLives = document.getElementById( 'lives' );
+const elWave  = document.getElementById( 'wave' );
+const elMsg   = document.getElementById( 'msg' );
+
+const hudCache = { score: null, lives: null, wave: null };
+function refreshHud() {
+  const inGame = game.state !== 'title';
+  const score = inGame ? String( game.score ) : '';
+  const lives = inGame && game.state === 'playing' ? '▲'.repeat( Math.max( 0, game.lives ) ) : '';
+  const wave  = inGame ? 'WAVE ' + game.wave : '';
+  if ( score !== hudCache.score ) { elScore.textContent = score; hudCache.score = score; }
+  if ( lives !== hudCache.lives ) { elLives.textContent = lives; hudCache.lives = lives; }
+  if ( wave  !== hudCache.wave  ) { elWave.textContent  = wave;  hudCache.wave  = wave; }
+}
+
+function setMsg( html ) { elMsg.innerHTML = html; }
+function flashMsg( html, seconds ) { setMsg( html ); game.msgTimer = seconds; }
+
+function titleMsg() {
+  const p = game.preset.toUpperCase();
+  return 'ANAGLYPH ASTEROIDS' +
+    '<small>wear red/cyan glasses — red lens on the LEFT eye</small>' +
+    '<small>ROTATE: arrows or W A S D &nbsp;·&nbsp; THRUST: SHIFT &nbsp;·&nbsp; FIRE: SPACE</small>' +
+    '<small>MOUSE: click to capture — steer &nbsp;·&nbsp; LEFT fire &nbsp;·&nbsp; RIGHT thrust (ESC releases)</small>' +
+    '<small>HYPERSPACE: H &nbsp;·&nbsp; MUTE: M</small>' +
+    '<small>DIFFICULTY [1] EASY [2] NORMAL [3] HARD — ' + p + '</small>' +
+    '<small>PRESS ENTER TO START</small>';
+}
+
+/* ================================================================== *
+ *  SOUND — all effects synthesized with WebAudio, no assets.         *
+ *  The context is created lazily on the first keypress (browsers    *
+ *  block audio before a user gesture).                               *
+ * ================================================================== */
+const AUDIO = { master: 0.5 };
+
+const Sound = ( () => {
+  let ctx = null, master = null, noiseBuf = null;
+  let thrustGain = null, saucerGain = null, saucerOsc = null, saucerLfo = null;
+  let muted = false, thrustOn = false, saucerKind = null;
+
+  function ensure() {
+    if ( !ctx ) {
+      ctx = new ( window.AudioContext || window.webkitAudioContext )();
+      master = ctx.createGain();
+      master.gain.value = AUDIO.master;
+      master.connect( ctx.destination );
+
+      noiseBuf = ctx.createBuffer( 1, ctx.sampleRate, ctx.sampleRate );
+      const data = noiseBuf.getChannelData( 0 );
+      for ( let i = 0; i < data.length; i++ ) data[i] = Math.random() * 2 - 1;
+
+      // Thrust: looping low-passed noise, gated by a gain node.
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      src.loop = true;
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 320;
+      thrustGain = ctx.createGain();
+      thrustGain.gain.value = 0;
+      src.connect( filter ).connect( thrustGain ).connect( master );
+      src.start();
+
+      // Saucer warble: square carrier with an LFO wobbling its pitch.
+      saucerOsc = ctx.createOscillator();
+      saucerOsc.type = 'square';
+      saucerOsc.frequency.value = 290;
+      saucerLfo = ctx.createOscillator();
+      saucerLfo.frequency.value = 4.5;
+      const lfoGain = ctx.createGain();
+      lfoGain.gain.value = 60;
+      saucerLfo.connect( lfoGain ).connect( saucerOsc.frequency );
+      saucerGain = ctx.createGain();
+      saucerGain.gain.value = 0;
+      saucerOsc.connect( saucerGain ).connect( master );
+      saucerOsc.start();
+      saucerLfo.start();
+    }
+    if ( ctx.state === 'suspended' ) ctx.resume();
+  }
+
+  // One-shot oscillator with a pitch sweep and exponential fade-out.
+  function blip( type, f0, f1, dur, vol ) {
+    if ( !ctx || muted ) return;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = type;
+    osc.frequency.setValueAtTime( f0, t );
+    osc.frequency.exponentialRampToValueAtTime( Math.max( f1, 1 ), t + dur );
+    const g = ctx.createGain();
+    g.gain.setValueAtTime( vol, t );
+    g.gain.exponentialRampToValueAtTime( 0.001, t + dur );
+    osc.connect( g ).connect( master );
+    osc.start();
+    osc.stop( t + dur );
+  }
+
+  // Noise burst through a closing low-pass filter — an explosion.
+  function boom( freq, dur, vol ) {
+    if ( !ctx || muted ) return;
+    const t = ctx.currentTime;
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime( freq, t );
+    filter.frequency.exponentialRampToValueAtTime( 40, t + dur );
+    const g = ctx.createGain();
+    g.gain.setValueAtTime( vol, t );
+    g.gain.exponentialRampToValueAtTime( 0.001, t + dur );
+    src.connect( filter ).connect( g ).connect( master );
+    src.start();
+    src.stop( t + dur );
+  }
+
+  return {
+    ensure,
+    toggleMute() {
+      ensure();
+      muted = !muted;
+      master.gain.value = muted ? 0 : AUDIO.master;
+      return muted;
+    },
+    fire()       { blip( 'square', 880, 220, 0.11, 0.18 ); },
+    saucerShot() { blip( 'sawtooth', 500, 140, 0.16, 0.15 ); },
+    explosion( sizeIdx ) { boom( 900 - sizeIdx * 220, 0.5 - sizeIdx * 0.08, 0.5 ); },
+    shipDeath()  { boom( 400, 1.1, 0.7 ); blip( 'sawtooth', 300, 30, 0.9, 0.25 ); },
+    hyperspace() { blip( 'sine', 200, 1400, 0.35, 0.25 ); },
+    extraLife()  { blip( 'square', 660, 660, 0.09, 0.2 );
+                   setTimeout( () => blip( 'square', 990, 990, 0.14, 0.2 ), 110 ); },
+    beat( high ) { blip( 'square', high ? 98 : 82, high ? 97 : 81, 0.07, 0.35 ); },
+    setThrust( on ) {
+      if ( !thrustGain || on === thrustOn ) return;
+      thrustOn = on;
+      thrustGain.gain.setTargetAtTime( on ? 0.3 : 0, ctx.currentTime, 0.05 );
+    },
+    setSaucer( kind ) { // null | 'large' | 'small'
+      if ( !saucerGain || kind === saucerKind ) return;
+      saucerKind = kind;
+      if ( kind ) {
+        saucerOsc.frequency.setValueAtTime( kind === 'small' ? 520 : 290, ctx.currentTime );
+        saucerLfo.frequency.setValueAtTime( kind === 'small' ? 8 : 4.5, ctx.currentTime );
+      }
+      saucerGain.gain.setTargetAtTime( kind ? 0.06 : 0, ctx.currentTime, 0.08 );
+    },
+  };
+} )();
+
+/* ================================================================== *
+ *  INPUT                                                             *
+ * ================================================================== */
+const keys = new Set();
+const PREVENT = new Set( [ 'Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight' ] );
+
+window.addEventListener( 'keydown', ( e ) => {
+  if ( PREVENT.has( e.code ) ) e.preventDefault();
+  keys.add( e.code );
+  Sound.ensure(); // first user gesture unlocks the audio context
+  if ( e.code === 'Enter' && ( game.state === 'title' || game.state === 'gameover' ) ) startGame();
+  if ( e.code === 'KeyH' ) tryHyperspace();
+  if ( e.code === 'KeyM' ) Sound.toggleMute();
+  const presetKey = { Digit1: 'easy', Digit2: 'normal', Digit3: 'hard' }[e.code];
+  if ( presetKey && game.state === 'title' ) { game.preset = presetKey; setMsg( titleMsg() ); }
+} );
+window.addEventListener( 'keyup', ( e ) => keys.delete( e.code ) );
+const key = ( code ) => keys.has( code );
+
+// Mouse: pointer-locked steering. Deltas accumulate here and are consumed
+// (and zeroed) once per frame by updateShip.
+const mouse = { dx: 0, dy: 0, fire: false, thrust: false, locked: false };
+const canvas = renderer.domElement;
+
+// Pointer lock can be denied (iframes, embedded previews); the game is
+// still fully playable by keyboard, so failure is silently ignored.
+function lockPointer() {
+  try {
+    const p = canvas.requestPointerLock();
+    if ( p && p.catch ) p.catch( () => {} );
+  } catch ( e ) { /* unavailable */ }
+}
+
+canvas.addEventListener( 'mousedown', ( e ) => {
+  Sound.ensure();
+  if ( game.state === 'title' || game.state === 'gameover' ) {
+    startGame();
+    lockPointer();
+    return;
+  }
+  if ( !mouse.locked ) lockPointer();
+  if ( e.button === 0 ) mouse.fire = true;
+  if ( e.button === 2 ) mouse.thrust = true;
+} );
+window.addEventListener( 'mouseup', ( e ) => {
+  if ( e.button === 0 ) mouse.fire = false;
+  if ( e.button === 2 ) mouse.thrust = false;
+} );
+canvas.addEventListener( 'contextmenu', ( e ) => e.preventDefault() );
+window.addEventListener( 'mousemove', ( e ) => {
+  if ( mouse.locked ) { mouse.dx += e.movementX; mouse.dy += e.movementY; }
+} );
+document.addEventListener( 'pointerlockchange', () => {
+  mouse.locked = document.pointerLockElement === canvas;
+  if ( !mouse.locked ) { mouse.fire = false; mouse.thrust = false; mouse.dx = 0; mouse.dy = 0; }
+} );
+
+/* ================================================================== *
+ *  SMALL HELPERS                                                     *
+ * ================================================================== */
+const rand = ( a, b ) => a + Math.random() * ( b - a );
+const clamp01 = ( x ) => Math.min( 1, Math.max( 0, x ) );
+const lerp = ( a, b, t ) => a + ( b - a ) * t;
+
+function wrapVec( p ) {
+  for ( const axis of [ 'x', 'y', 'z' ] ) {
+    if ( p[axis] >  FIELD_HALF ) p[axis] -= RENDER.fieldSize;
+    else if ( p[axis] < -FIELD_HALF ) p[axis] += RENDER.fieldSize;
+  }
+}
+
+const _zero = new THREE.Vector3();
+
+function outOfField( p, margin ) {
+  return Math.abs( p.x ) > FIELD_HALF + margin ||
+         Math.abs( p.y ) > FIELD_HALF + margin ||
+         Math.abs( p.z ) > FIELD_HALF + margin;
+}
+
+/* ================================================================== *
+ *  GAME STATE                                                        *
+ * ================================================================== */
+const game = {
+  state: 'title', // 'title' | 'playing' | 'gameover'
+  preset: 'normal',
+  score: 0, lives: 0, wave: 0,
+  nextExtraLife: 0,
+  saucerTimer: 0,
+  waveClearTimer: -1,
+  msgTimer: 0,
+  time: 0,
+  beatTimer: 0,
+  beatHigh: false,
+  asteroids: [], saucers: [], playerBullets: [], saucerBullets: [], explosions: [],
+};
+
+function addScore( n ) {
+  game.score += n;
+  if ( C.scoring.extraLifeEvery > 0 && game.score >= game.nextExtraLife ) {
+    game.lives++;
+    game.nextExtraLife += C.scoring.extraLifeEvery;
+    flashMsg( 'EXTRA SHIP', 1.5 );
+    Sound.extraLife();
+  }
+}
+
+/* ================================================================== *
+ *  SHIP                                                              *
+ * ================================================================== */
+function makeShipMesh() {
+  const group = new THREE.Group();
+  const geo = new THREE.ConeGeometry( 2.2, 6, 4 );
+  geo.rotateX( Math.PI / 2 ); // nose points +Z
+  const body = new THREE.Mesh( geo, new THREE.MeshStandardMaterial( {
+    color: 0xe8eef8, flatShading: true, metalness: 0.35, roughness: 0.35,
+    emissive: 0x8899bb, emissiveIntensity: 0.15 } ) );
+  const edges = new THREE.LineSegments( new THREE.EdgesGeometry( geo ),
+    new THREE.LineBasicMaterial( { color: 0xffffff, transparent: true, opacity: 0.6 } ) );
+  // Short aim line off the nose — makes the 3D facing direction readable.
+  const aimGeo = new THREE.BufferGeometry().setFromPoints(
+    [ new THREE.Vector3( 0, 0, 3.5 ), new THREE.Vector3( 0, 0, 18 ) ] );
+  const aim = new THREE.Line( aimGeo,
+    new THREE.LineBasicMaterial( { color: 0x88aaff, transparent: true, opacity: 0.45 } ) );
+  // Exhaust flame, shown while thrusting.
+  const flameGeo = new THREE.ConeGeometry( 1.1, 3.2, 6 );
+  flameGeo.rotateX( -Math.PI / 2 ); // tip trails behind the ship (-Z)
+  const flame = new THREE.Mesh( flameGeo,
+    new THREE.MeshBasicMaterial( { color: 0xffaa33, transparent: true, opacity: 0.85 } ) );
+  flame.position.z = -3.4;
+  flame.name = 'flame';
+  flame.visible = false;
+  group.add( body, edges, aim, flame );
+  return group;
+}
+
+const ship = {
+  mesh: makeShipMesh(),
+  vel: new THREE.Vector3(),
+  radius: C.ship.radius,
+  quat: new THREE.Quaternion(), // logical orientation (bank roll excluded)
+  roll: 0,
+  alive: false,
+  invuln: 0,
+  fireCooldown: 0,
+  respawnTimer: 0,
+  inHyper: false,
+  hyperTimer: 0,
+  hyperCooldown: 0,
+};
+ship.flame = ship.mesh.getObjectByName( 'flame' );
+ship.mesh.visible = false;
+scene.add( ship.mesh );
+
+function resetShip() {
+  ship.mesh.position.set( 0, 0, 0 );
+  ship.vel.set( 0, 0, 0 );
+  ship.quat.setFromEuler( _euler.set( -Math.PI / 2, 0, 0, 'YXZ' ) ); // nose straight up
+  ship.roll = 0;
+  ship.mesh.quaternion.copy( ship.quat );
+  ship.alive = true;
+  ship.inHyper = false;
+  ship.hyperTimer = 0;
+  ship.hyperCooldown = 0;
+  ship.flame.visible = false;
+  ship.mesh.visible = true;
+  ship.invuln = C.ship.respawnInvuln;
+  ship.fireCooldown = 0;
+}
+
+function areaClear( pos, r ) {
+  const threats = [ ...game.asteroids, ...game.saucers, ...game.saucerBullets ];
+  return !threats.some( ( t ) => t.mesh.position.distanceTo( pos ) < r + t.radius );
+}
+
+const _fwd = new THREE.Vector3();
+const _euler = new THREE.Euler();
+const _qTurn = new THREE.Quaternion();
+const _axisX = new THREE.Vector3( 1, 0, 0 );
+const _axisY = new THREE.Vector3( 0, 1, 0 );
+const _axisZ = new THREE.Vector3( 0, 0, 1 );
+
+function tryHyperspace() {
+  if ( game.state !== 'playing' || !ship.alive || ship.inHyper || ship.hyperCooldown > 0 ) return;
+  ship.inHyper = true;
+  ship.hyperTimer = C.ship.hyperspace.travelTime;
+  ship.hyperCooldown = C.ship.hyperspace.travelTime + C.ship.hyperspace.cooldown;
+  ship.mesh.visible = false;
+  ship.flame.visible = false;
+  Sound.setThrust( false );
+  Sound.hyperspace();
+}
+
+function updateShip( dt ) {
+  if ( !ship.alive ) {
+    mouse.dx = 0; mouse.dy = 0; // don't bank up a snap-turn while dead
+    if ( game.lives > 0 ) {
+      ship.respawnTimer -= dt;
+      if ( ship.respawnTimer <= 0 && areaClear( _zero, C.ship.safeRespawnRadius ) ) resetShip();
+    }
+    return;
+  }
+
+  // Hyperspace transit: the ship is gone, then re-enters at a random
+  // point with no safety check — materializing inside a rock is fatal,
+  // as in the original. A small destruct chance applies on top.
+  if ( ship.inHyper ) {
+    mouse.dx = 0; mouse.dy = 0;
+    ship.hyperTimer -= dt;
+    if ( ship.hyperTimer <= 0 ) {
+      ship.inHyper = false;
+      ship.mesh.position.set(
+        rand( -FIELD_HALF * 0.9, FIELD_HALF * 0.9 ),
+        rand( -FIELD_HALF * 0.9, FIELD_HALF * 0.9 ),
+        rand( -FIELD_HALF * 0.9, FIELD_HALF * 0.9 ) );
+      ship.vel.set( 0, 0, 0 );
+      if ( Math.random() < C.ship.hyperspace.destructChance ) { killShip(); return; }
+      ship.mesh.visible = true;
+    }
+    return;
+  }
+  ship.hyperCooldown -= dt;
+
+  // Classic rotate-and-thrust: arrows/WASD turn the nose, Shift burns
+  // along the facing vector; momentum carries you the rest of the way.
+  // Rotation is body-frame (about the ship's own axes), not world yaw/
+  // pitch: every input always moves the nose — no gimbal dead states —
+  // and full 360° rotation works on both axes, as in the original.
+  // At spawn, left/right turns the ship in the screen plane like 2D
+  // Asteroids; up/down pitches it through the depth axis.
+  const yawIn   = ( ( key( 'KeyD' ) || key( 'ArrowRight' ) ) ? 1 : 0 ) - ( ( key( 'KeyA' ) || key( 'ArrowLeft' ) ) ? 1 : 0 );
+  const pitchIn = ( ( key( 'KeyW' ) || key( 'ArrowUp' ) )    ? 1 : 0 ) - ( ( key( 'KeyS' ) || key( 'ArrowDown' ) ) ? 1 : 0 );
+  const pitchDir = C.ship.invertPitch ? -1 : 1;
+  // Keys give a fixed turn rate; pointer-locked mouse movement adds its
+  // own angle on the same body axes (mouse up = same direction as W).
+  const yawAngle   = yawIn * C.ship.rotRate * dt + mouse.dx * C.ship.mouseSensitivity;
+  const pitchAngle = pitchIn * C.ship.rotRate * dt - mouse.dy * C.ship.mouseSensitivity;
+  mouse.dx = 0; mouse.dy = 0;
+  if ( yawAngle !== 0 )
+    ship.quat.multiply( _qTurn.setFromAxisAngle( _axisY, yawAngle ) );
+  if ( pitchAngle !== 0 )
+    ship.quat.multiply( _qTurn.setFromAxisAngle( _axisX, -pitchDir * pitchAngle ) );
+  ship.quat.normalize();
+  // Visual bank into turns — rolling about the nose axis never changes
+  // the facing vector, so aiming is unaffected.
+  const rollDrive = THREE.MathUtils.clamp( yawAngle / Math.max( C.ship.rotRate * dt, 1e-6 ), -1, 1 );
+  const targetRoll = -rollDrive * C.ship.bankAngle;
+  ship.roll += ( targetRoll - ship.roll ) * ( 1 - Math.exp( -8 * dt ) );
+  ship.mesh.quaternion.copy( ship.quat ).multiply( _qTurn.setFromAxisAngle( _axisZ, ship.roll ) );
+
+  const thrusting = key( 'ShiftLeft' ) || key( 'ShiftRight' ) || mouse.thrust;
+  if ( thrusting ) {
+    ship.mesh.getWorldDirection( _fwd );
+    ship.vel.addScaledVector( _fwd, C.ship.thrust * dt );
+  }
+  ship.flame.visible = thrusting;
+  Sound.setThrust( thrusting );
+
+  ship.vel.multiplyScalar( Math.exp( -C.ship.damping * dt ) );
+  if ( ship.vel.length() > C.ship.maxSpeed ) ship.vel.setLength( C.ship.maxSpeed );
+
+  ship.mesh.position.addScaledVector( ship.vel, dt );
+  wrapVec( ship.mesh.position );
+
+  // Invulnerability blink.
+  if ( ship.invuln > 0 ) {
+    ship.invuln -= dt;
+    ship.mesh.visible = ship.invuln <= 0 || Math.floor( game.time * 10 ) % 2 === 0;
+  } else {
+    ship.mesh.visible = true;
+  }
+
+  // Fire along the facing vector.
+  ship.fireCooldown -= dt;
+  if ( ( key( 'Space' ) || mouse.fire ) && ship.fireCooldown <= 0 && game.playerBullets.length < C.ship.maxBullets ) {
+    ship.fireCooldown = C.ship.fireInterval;
+    ship.mesh.getWorldDirection( _fwd );
+    const origin = ship.mesh.position.clone().addScaledVector( _fwd, 4.5 );
+    const vel = _fwd.clone().multiplyScalar( C.ship.bulletSpeed ).add( ship.vel );
+    spawnBullet( origin, vel, C.ship.bulletLife, true );
+    Sound.fire();
+  }
+}
+
+function killShip() {
+  spawnExplosion( ship.mesh.position, 0xffffff, 42, 38, 1.0, 1.9 );
+  Sound.shipDeath();
+  Sound.setThrust( false );
+  ship.alive = false;
+  ship.inHyper = false;
+  ship.mesh.visible = false;
+  ship.flame.visible = false;
+  game.lives--;
+  if ( game.lives <= 0 ) {
+    game.state = 'gameover';
+    setMsg( 'GAME OVER<small>SCORE ' + game.score + '</small><small>PRESS ENTER TO PLAY AGAIN</small>' );
+  } else {
+    ship.respawnTimer = C.ship.respawnDelay;
+  }
+}
+
+/* ================================================================== *
+ *  BULLETS                                                           *
+ * ================================================================== */
+const playerBulletGeo = new THREE.SphereGeometry( 0.7, 8, 6 );
+const playerBulletMat = new THREE.MeshBasicMaterial( { color: 0xddffee } );
+const saucerBulletGeo = new THREE.SphereGeometry( 1.0, 8, 6 );
+const saucerBulletMat = new THREE.MeshBasicMaterial( { color: 0xffbb55 } );
+
+function spawnBullet( pos, vel, life, isPlayer ) {
+  const mesh = isPlayer
+    ? new THREE.Mesh( playerBulletGeo, playerBulletMat )
+    : new THREE.Mesh( saucerBulletGeo, saucerBulletMat );
+  mesh.position.copy( pos );
+  scene.add( mesh );
+  const b = { mesh, vel: vel.clone(), life, radius: isPlayer ? 0.7 : 1.0, dead: false };
+  ( isPlayer ? game.playerBullets : game.saucerBullets ).push( b );
+}
+
+function updateBullets( dt ) {
+  for ( const list of [ game.playerBullets, game.saucerBullets ] ) {
+    for ( const b of list ) {
+      b.mesh.position.addScaledVector( b.vel, dt );
+      wrapVec( b.mesh.position );
+      b.life -= dt;
+      if ( b.life <= 0 ) b.dead = true;
+    }
+  }
+}
+
+/* ================================================================== *
+ *  ASTEROIDS — Platonic solids, gem/wireframe treatment              *
+ * ================================================================== */
+const ASTEROID_GEOMS = [
+  new THREE.IcosahedronGeometry( 1, 0 ),
+  new THREE.IcosahedronGeometry( 1, 1 ),
+  new THREE.DodecahedronGeometry( 1, 0 ),
+  new THREE.OctahedronGeometry( 1, 0 ),
+  new THREE.OctahedronGeometry( 1, 1 ),
+  new THREE.TetrahedronGeometry( 1, 0 ),
+];
+const ASTEROID_EDGE_GEOMS = ASTEROID_GEOMS.map( ( g ) => new THREE.EdgesGeometry( g ) );
+
+// Desaturated cool palette — saturated pure red/cyan would vanish in one
+// eye of the anaglyph and cause retinal rivalry.
+const ASTEROID_COLORS = [ 0x9fc5e8, 0xb4a7d6, 0xa2c4a0, 0xd5c59f, 0xc9cdd4, 0x8fbfbf ];
+
+const solidMatCache = new Map();
+function solidMat( color ) {
+  if ( !solidMatCache.has( color ) ) {
+    solidMatCache.set( color, new THREE.MeshStandardMaterial( {
+      color, flatShading: true, metalness: 0.3, roughness: 0.4,
+      emissive: color, emissiveIntensity: 0.12 } ) );
+  }
+  return solidMatCache.get( color );
+}
+const wireMatCache = new Map();
+function wireMat( color ) {
+  if ( !wireMatCache.has( color ) ) {
+    wireMatCache.set( color, new THREE.MeshBasicMaterial( { color, wireframe: true } ) );
+  }
+  return wireMatCache.get( color );
+}
+const edgeOverlayMat = new THREE.LineBasicMaterial( { color: 0xffffff, transparent: true, opacity: 0.35 } );
+
+function spawnAsteroid( sizeIdx, pos, vel, waveSpeed ) {
+  const size = C.asteroids.sizes[sizeIdx];
+  const gi = Math.floor( Math.random() * ASTEROID_GEOMS.length );
+  const color = ASTEROID_COLORS[Math.floor( Math.random() * ASTEROID_COLORS.length )];
+  const style = Math.random(); // ~50% gem, ~25% wireframe, ~25% gem+edges
+
+  const group = new THREE.Group();
+  if ( style < 0.25 ) {
+    group.add( new THREE.Mesh( ASTEROID_GEOMS[gi], wireMat( color ) ) );
+  } else {
+    group.add( new THREE.Mesh( ASTEROID_GEOMS[gi], solidMat( color ) ) );
+    if ( style > 0.75 ) group.add( new THREE.LineSegments( ASTEROID_EDGE_GEOMS[gi], edgeOverlayMat ) );
+  }
+  group.scale.setScalar( size.radius );
+  group.position.copy( pos );
+  group.rotation.set( rand( 0, Math.PI ), rand( 0, Math.PI ), rand( 0, Math.PI ) );
+  scene.add( group );
+
+  game.asteroids.push( {
+    mesh: group, vel: vel.clone(), radius: size.radius * 0.95,
+    size: sizeIdx, color, waveSpeed,
+    angVel: new THREE.Vector3().randomDirection().multiplyScalar( rand( 0.2, C.asteroids.maxTumble ) ),
+    dead: false,
+  } );
+}
+
+function waveSpeedFor( wave ) {
+  return Math.min( C.waves.baseSpeed + ( wave - 1 ) * C.waves.speedPerWave, C.waves.speedCap );
+}
+
+function spawnWave( wave ) {
+  const count = Math.min( C.waves.baseAsteroids + ( wave - 1 ) * C.waves.asteroidsPerWave, C.waves.maxAsteroids );
+  const speed = waveSpeedFor( wave );
+  const avoid = ship.alive ? ship.mesh.position : _zero;
+  const pos = new THREE.Vector3();
+  for ( let i = 0; i < count; i++ ) {
+    for ( let tries = 0; tries < 60; tries++ ) {
+      pos.set( rand( -FIELD_HALF, FIELD_HALF ), rand( -FIELD_HALF, FIELD_HALF ), rand( -FIELD_HALF, FIELD_HALF ) );
+      if ( pos.distanceTo( avoid ) >= C.waves.spawnSafeRadius ) break;
+    }
+    const vel = new THREE.Vector3().randomDirection().multiplyScalar( speed );
+    spawnAsteroid( 0, pos, vel, speed );
+  }
+}
+
+function destroyAsteroid( a, awardScore ) {
+  if ( a.dead ) return;
+  a.dead = true;
+  spawnExplosion( a.mesh.position, a.color, 16, 26, 0.7, 1.4 );
+  Sound.explosion( a.size );
+  if ( awardScore ) addScore( C.asteroids.sizes[a.size].score );
+  const children = C.asteroids.sizes[a.size].children;
+  const next = a.size + 1;
+  if ( children > 0 && next < C.asteroids.sizes.length ) {
+    for ( let i = 0; i < children; i++ ) {
+      const dir = a.vel.clone().normalize()
+        .add( new THREE.Vector3().randomDirection().multiplyScalar( 0.8 ) ).normalize();
+      const speed = a.waveSpeed * C.asteroids.sizes[next].speedMul;
+      spawnAsteroid( next, a.mesh.position, dir.multiplyScalar( speed ), a.waveSpeed );
+    }
+  }
+}
+
+function updateAsteroids( dt ) {
+  for ( const a of game.asteroids ) {
+    a.mesh.position.addScaledVector( a.vel, dt );
+    wrapVec( a.mesh.position );
+    a.mesh.rotation.x += a.angVel.x * dt;
+    a.mesh.rotation.y += a.angVel.y * dt;
+    a.mesh.rotation.z += a.angVel.z * dt;
+  }
+}
+
+/* ================================================================== *
+ *  SAUCERS — warm-colored, non-Platonic shapes so they read as       *
+ *  threats at a glance                                               *
+ * ================================================================== */
+const saucerMats = {
+  largeHull: new THREE.MeshStandardMaterial( { color: 0xffaa44, emissive: 0xff8822,
+    emissiveIntensity: 0.5, flatShading: true, metalness: 0.4, roughness: 0.35 } ),
+  largeDome: new THREE.MeshStandardMaterial( { color: 0xffe0aa, emissive: 0xffcc77,
+    emissiveIntensity: 0.6, flatShading: true, metalness: 0.2, roughness: 0.3 } ),
+  small: new THREE.MeshStandardMaterial( { color: 0xff66aa, emissive: 0xff3388,
+    emissiveIntensity: 0.6, flatShading: true, metalness: 0.4, roughness: 0.35 } ),
+};
+
+function makeSaucerMesh( kind, r ) {
+  const group = new THREE.Group();
+  if ( kind === 'large' ) {
+    // Classic saucer silhouette: flat torus ring + dome.
+    const ring = new THREE.Mesh( new THREE.TorusGeometry( r * 0.8, r * 0.32, 8, 20 ), saucerMats.largeHull );
+    ring.rotation.x = Math.PI / 2;
+    const dome = new THREE.Mesh( new THREE.SphereGeometry( r * 0.45, 12, 8 ), saucerMats.largeDome );
+    dome.position.y = r * 0.28;
+    group.add( ring, dome );
+  } else {
+    // Small killer: a spinning torus knot — clearly outside the Platonic family.
+    group.add( new THREE.Mesh( new THREE.TorusKnotGeometry( r * 0.55, r * 0.2, 48, 8 ), saucerMats.small ) );
+  }
+  return group;
+}
+
+function currentSaucerInterval() {
+  return lerp( C.saucers.baseInterval, C.saucers.minInterval,
+    clamp01( game.score / C.saucers.intervalRampScore ) );
+}
+
+function spawnSaucer( forceKind ) {
+  const small = forceKind ? forceKind === 'small'
+    : Math.random() < lerp( C.saucers.smallChanceBase, C.saucers.smallChanceMax,
+        clamp01( game.score / C.saucers.smallChanceRampScore ) );
+  const cfg = small ? C.saucers.small : C.saucers.large;
+
+  // Spawn on a random face of the boundary cube.
+  const pos = new THREE.Vector3( rand( -FIELD_HALF, FIELD_HALF ),
+    rand( -FIELD_HALF, FIELD_HALF ), rand( -FIELD_HALF, FIELD_HALF ) );
+  const axis = [ 'x', 'y', 'z' ][Math.floor( Math.random() * 3 )];
+  pos[axis] = ( Math.random() < 0.5 ? -1 : 1 ) * ( FIELD_HALF - 1 );
+
+  const mesh = makeSaucerMesh( small ? 'small' : 'large', cfg.radius );
+  mesh.position.copy( pos );
+  scene.add( mesh );
+
+  const s = {
+    mesh, kind: small ? 'small' : 'large', cfg,
+    vel: new THREE.Vector3(), radius: cfg.radius,
+    wanderTimer: 0, fireTimer: cfg.fireInterval * 1.5,
+    life: C.saucers.lifetime, leaving: false, dead: false,
+    spin: small ? 3.0 : 1.2,
+  };
+  pickWanderDirection( s );
+  game.saucers.push( s );
+  return s;
+}
+
+function pickWanderDirection( s ) {
+  // Head toward a random point in the inner cube — a drifting patrol path.
+  const target = new THREE.Vector3( rand( -FIELD_HALF, FIELD_HALF ) * 0.7,
+    rand( -FIELD_HALF, FIELD_HALF ) * 0.7, rand( -FIELD_HALF, FIELD_HALF ) * 0.7 );
+  s.vel.copy( target.sub( s.mesh.position ).normalize().multiplyScalar( s.cfg.speed ) );
+  s.wanderTimer = s.cfg.wanderInterval * rand( 0.7, 1.3 );
+}
+
+function saucerFire( s ) {
+  let dir;
+  if ( s.kind === 'large' ) {
+    dir = new THREE.Vector3().randomDirection();
+  } else {
+    if ( !ship.alive ) return;
+    // Aim at the player with an error cone that tightens as score rises.
+    const err = lerp( s.cfg.aimErrorMax, s.cfg.aimErrorMin,
+      clamp01( game.score / s.cfg.aimRampScore ) );
+    dir = ship.mesh.position.clone().sub( s.mesh.position ).normalize();
+    dir.add( new THREE.Vector3().randomDirection()
+      .multiplyScalar( Math.tan( err ) * Math.random() ) ).normalize();
+  }
+  const origin = s.mesh.position.clone().addScaledVector( dir, s.radius + 1.5 );
+  spawnBullet( origin, dir.multiplyScalar( s.cfg.bulletSpeed ), s.cfg.bulletLife, false );
+  Sound.saucerShot();
+}
+
+function destroySaucer( s, awardScore ) {
+  if ( s.dead ) return;
+  s.dead = true;
+  spawnExplosion( s.mesh.position, s.kind === 'small' ? 0xff66aa : 0xffaa44, 24, 30, 0.8, 1.6 );
+  Sound.explosion( s.kind === 'small' ? 2 : 1 );
+  if ( awardScore ) addScore( s.cfg.score );
+}
+
+function updateSaucers( dt ) {
+  for ( const s of game.saucers ) {
+    s.mesh.position.addScaledVector( s.vel, dt );
+    s.mesh.rotation.y += s.spin * dt;
+    if ( s.kind === 'small' ) s.mesh.rotation.x += s.spin * 0.6 * dt;
+
+    s.life -= dt;
+    if ( s.life <= 0 ) s.leaving = true;
+    if ( s.leaving ) {
+      // Stop wrapping; the saucer flies off the field and despawns.
+      if ( outOfField( s.mesh.position, s.radius * 3 ) ) { s.dead = true; continue; }
+    } else {
+      wrapVec( s.mesh.position );
+      s.wanderTimer -= dt;
+      if ( s.wanderTimer <= 0 ) pickWanderDirection( s );
+    }
+
+    if ( game.state === 'playing' ) {
+      s.fireTimer -= dt;
+      if ( s.fireTimer <= 0 ) { s.fireTimer = s.cfg.fireInterval; saucerFire( s ); }
+    }
+  }
+}
+
+function updateSaucerSpawning( dt ) {
+  game.saucerTimer -= dt;
+  if ( game.saucerTimer <= 0 ) {
+    if ( game.saucers.length < C.saucers.maxActive ) spawnSaucer();
+    game.saucerTimer = currentSaucerInterval();
+  }
+}
+
+/* ================================================================== *
+ *  EXPLOSIONS (particle bursts)                                      *
+ * ================================================================== */
+function spawnExplosion( pos, color, count, speed, life, size ) {
+  const positions = new Float32Array( count * 3 );
+  const vels = [];
+  for ( let i = 0; i < count; i++ ) {
+    vels.push( new THREE.Vector3().randomDirection().multiplyScalar( speed * rand( 0.3, 1 ) ) );
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
+  const mat = new THREE.PointsMaterial( { color, size, transparent: true,
+    opacity: 1, depthWrite: false, sizeAttenuation: true } );
+  const mesh = new THREE.Points( geo, mat );
+  mesh.position.copy( pos );
+  scene.add( mesh );
+  game.explosions.push( { mesh, vels, t: 0, life, dead: false } );
+}
+
+function updateExplosions( dt ) {
+  for ( const ex of game.explosions ) {
+    ex.t += dt;
+    if ( ex.t >= ex.life ) { ex.dead = true; continue; }
+    const arr = ex.mesh.geometry.attributes.position.array;
+    for ( let i = 0; i < ex.vels.length; i++ ) {
+      arr[i * 3]     += ex.vels[i].x * dt;
+      arr[i * 3 + 1] += ex.vels[i].y * dt;
+      arr[i * 3 + 2] += ex.vels[i].z * dt;
+    }
+    ex.mesh.geometry.attributes.position.needsUpdate = true;
+    ex.mesh.material.opacity = 1 - ex.t / ex.life;
+  }
+}
+
+/* ================================================================== *
+ *  COLLISIONS (sphere vs sphere)                                     *
+ * ================================================================== */
+function hits( a, b ) {
+  const r = a.radius + b.radius;
+  return a.mesh.position.distanceToSquared( b.mesh.position ) < r * r;
+}
+
+function handleCollisions() {
+  // Player bullets vs asteroids and saucers.
+  for ( const b of game.playerBullets ) {
+    if ( b.dead ) continue;
+    for ( const a of game.asteroids ) {
+      if ( !a.dead && hits( b, a ) ) { b.dead = true; destroyAsteroid( a, true ); break; }
+    }
+    if ( b.dead ) continue;
+    for ( const s of game.saucers ) {
+      if ( !s.dead && hits( b, s ) ) { b.dead = true; destroySaucer( s, true ); break; }
+    }
+  }
+
+  // Saucer bullets clear asteroids too (no score), as in the original.
+  for ( const b of game.saucerBullets ) {
+    if ( b.dead ) continue;
+    for ( const a of game.asteroids ) {
+      if ( !a.dead && hits( b, a ) ) { b.dead = true; destroyAsteroid( a, false ); break; }
+    }
+  }
+
+  // Saucers collide with asteroids: both die, no score (as in the original).
+  for ( const s of game.saucers ) {
+    if ( s.dead ) continue;
+    for ( const a of game.asteroids ) {
+      if ( !a.dead && hits( s, a ) ) { destroySaucer( s, false ); destroyAsteroid( a, false ); break; }
+    }
+  }
+
+  // Everything vs the ship.
+  if ( ship.alive && !ship.inHyper && ship.invuln <= 0 ) {
+    const shipHit =
+      game.asteroids.some( ( a ) => !a.dead && hits( a, ship ) ) ||
+      game.saucers.some( ( s ) => !s.dead && hits( s, ship ) ) ||
+      game.saucerBullets.some( ( b ) => {
+        if ( !b.dead && hits( b, ship ) ) { b.dead = true; return true; }
+        return false;
+      } );
+    if ( shipHit ) killShip();
+  }
+}
+
+/* ================================================================== *
+ *  GAME FLOW                                                         *
+ * ================================================================== */
+function clearEntities() {
+  for ( const list of [ game.asteroids, game.saucers, game.playerBullets, game.saucerBullets, game.explosions ] ) {
+    for ( const e of list ) {
+      scene.remove( e.mesh );
+      if ( e.vels ) { e.mesh.geometry.dispose(); e.mesh.material.dispose(); } // explosions own their resources
+    }
+  }
+  game.asteroids = []; game.saucers = [];
+  game.playerBullets = []; game.saucerBullets = []; game.explosions = [];
+}
+
+function sweepDead() {
+  const sweep = ( list ) => list.filter( ( e ) => {
+    if ( e.dead ) {
+      scene.remove( e.mesh );
+      if ( e.vels ) { e.mesh.geometry.dispose(); e.mesh.material.dispose(); }
+    }
+    return !e.dead;
+  } );
+  game.asteroids = sweep( game.asteroids );
+  game.saucers = sweep( game.saucers );
+  game.playerBullets = sweep( game.playerBullets );
+  game.saucerBullets = sweep( game.saucerBullets );
+  game.explosions = sweep( game.explosions );
+}
+
+function startGame() {
+  C = deepMerge( DIFFICULTY_BASE, DIFFICULTY_PRESETS[game.preset] );
+  clearEntities();
+  game.score = 0;
+  game.lives = C.ship.lives;
+  game.wave = 1;
+  game.nextExtraLife = C.scoring.extraLifeEvery;
+  game.saucerTimer = C.saucers.firstDelay;
+  game.waveClearTimer = -1;
+  game.beatTimer = 0;
+  ship.radius = C.ship.radius;
+  resetShip();
+  spawnWave( 1 );
+  game.state = 'playing';
+  flashMsg( 'WAVE 1', 2 );
+}
+
+function showTitle() {
+  game.state = 'title';
+  setMsg( titleMsg() );
+  // Decorative drift behind the title.
+  for ( let i = 0; i < 6; i++ ) {
+    const pos = new THREE.Vector3( rand( -FIELD_HALF, FIELD_HALF ),
+      rand( -FIELD_HALF, FIELD_HALF ), rand( -FIELD_HALF, FIELD_HALF ) );
+    const speed = C.waves.baseSpeed;
+    spawnAsteroid( 0, pos, new THREE.Vector3().randomDirection().multiplyScalar( speed ), speed );
+  }
+}
+
+function checkWaveClear( dt ) {
+  if ( game.asteroids.length === 0 ) {
+    if ( game.waveClearTimer < 0 ) game.waveClearTimer = C.waves.clearDelay;
+    game.waveClearTimer -= dt;
+    if ( game.waveClearTimer <= 0 ) {
+      game.wave++;
+      game.waveClearTimer = -1;
+      spawnWave( game.wave );
+      flashMsg( 'WAVE ' + game.wave, 2 );
+    }
+  }
+}
+
+/* ================================================================== *
+ *  MAIN LOOP                                                         *
+ * ================================================================== */
+const clock = new THREE.Clock();
+
+function update( dt ) {
+  game.time += dt;
+
+  updateAsteroids( dt );
+  updateSaucers( dt );
+  updateBullets( dt );
+  updateExplosions( dt );
+
+  if ( game.state === 'playing' ) {
+    updateShip( dt );
+    updateSaucerSpawning( dt );
+    handleCollisions();
+    checkWaveClear( dt );
+  }
+
+  sweepDead();
+
+  // Ambient audio: the classic accelerating two-tone beat, and the
+  // saucer warble whenever one is on the field.
+  if ( game.state === 'playing' && game.asteroids.length > 0 ) {
+    game.beatTimer -= dt;
+    if ( game.beatTimer <= 0 ) {
+      game.beatHigh = !game.beatHigh;
+      Sound.beat( game.beatHigh );
+      game.beatTimer = Math.min( 1.0, 0.3 + game.asteroids.length * 0.055 );
+    }
+  }
+  Sound.setSaucer( game.state !== 'playing' ? null
+    : game.saucers.some( ( s ) => s.kind === 'small' ) ? 'small'
+    : game.saucers.length > 0 ? 'large' : null );
+
+  if ( game.msgTimer > 0 ) {
+    game.msgTimer -= dt;
+    if ( game.msgTimer <= 0 && game.state === 'playing' ) setMsg( '' );
+  }
+  refreshHud();
+}
+
+function tick() {
+  requestAnimationFrame( tick );
+  const dt = Math.min( clock.getDelta(), 0.05 );
+  update( dt );
+  effect.render( scene, camera );
+}
+
+window.addEventListener( 'resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  effect.setSize( window.innerWidth, window.innerHeight );
+} );
+
+showTitle();
+tick();
+
+// Debug/verification hook (harmless in play; used by headless checks).
+window.__game = { game, ship, mouse, C: () => C, spawnSaucer, FIELD_HALF };
+</script>
+</body>
+</html>
